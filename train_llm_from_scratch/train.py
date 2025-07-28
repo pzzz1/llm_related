@@ -75,25 +75,29 @@ class Attention(nn.Module):
         super().__init__()
         self.config = config
         self.dropout = config.dropout
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
+        self.hidden_size = config.hidden_size  # 每个词向量的维度
+        self.num_heads = config.num_attention_heads  # 把「注意力」分成几个头
+        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)  # 每个头处理的维度
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.k_cache, self.v_cache = None, None
         self.is_causal = True
         self.flash_attn = self.config.flash_attn
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+        // 线性变化（投影层），分别用于生成Query, Key, Value
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)   //  Q投影矩阵
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)  //  K投影矩阵
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)  //  V投影矩阵
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)  // 用于线性变化回原始维度
         self.residual_dropout = nn.Dropout(self.dropout)
         self.attention_dropout = nn.Dropout(self.dropout)
-        self.rotary_emb = RotaryEmbedding(self.head_dim)
+        self.rotary_emb = RotaryEmbedding(self.head_dim)  // 旋转位置编码
         
     def forward(self, hidden_states, use_kv_cache=False):
-        b, s = hidden_states.shape[:2]
+        # 网络的前向传播过程，这部分是核心逻辑
+        # b = batchsize批次大小  s = seq_len序列长度， 输入hidden_states = [b, s, hidden_size] 表示b个句子，每个句子s个词，每个词hidden_size维。
+        b, s = hidden_states.shape[:2]  
+        # 当有KV缓存时，使用KV缓存减少计算量，否则将输入与投影矩阵直接计算得到q,k,v，[b, s, hidden_size] -----> [b, s, num_heads*head_dim]
         if use_kv_cache and self.eval():
             if self.k_cache is None or self.k_cache.shape[1] != s-1:
                 q, k, v = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
@@ -105,40 +109,47 @@ class Attention(nn.Module):
             self.k_cache, self.v_cache = k, v
             
         else:
-            q, k, v = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
-            
-        q = q.view(b, s, self.num_heads, self.head_dim)
-        k = k.view(b, s, self.num_key_value_heads, self.head_dim)
-        v = v.view(b, s, self.num_key_value_heads, self.head_dim)
+            q, k, v = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)  
+
+        # 调整q,k,v的形状，主要是将词向量按照注意力头分成 num_heads*head_dim 维度的形状，相当于划分出多个专家。
+        q = q.view(b, s, self.num_heads, self.head_dim)  # [b, s, num_heads*head_dim] -----> [b, s, num_heads, head_dim]
+        # 这里用了分组注意力，减少计算量，相当于num_heads个头但是只用num_key_value_heads组KV值
+        k = k.view(b, s, self.num_key_value_heads, self.head_dim)  #  [b, s, hidden_size] -----> [b, s, num_key_value_heads, head_dim]  
+        v = v.view(b, s, self.num_key_value_heads, self.head_dim)  #  [b, s, hidden_size] -----> [b, s, num_key_value_heads, head_dim]  
+        q, k = self.rotary_emb(q, k)  # 旋转位置编码计算，嵌入位置信息
         
-        q, k = self.rotary_emb(q, k)
+        k = repeat_kv(k, self.num_key_value_groups)  #  分组注意力，把两个头复制成八个 [b, s, num_key_value_heads, head_dim] -----> [b, s, num_heads, head_dim]
+        v = repeat_kv(v, self.num_key_value_groups)  #  分组注意力，把两个头复制成八个 [b, s, num_key_value_heads, head_dim] -----> [b, s, num_heads, head_dim]
         
-        k = repeat_kv(k, self.num_key_value_groups)
-        v = repeat_kv(v, self.num_key_value_groups)
-        
-        q = q.transpose(1, 2) # b, self.num_heads, s, self.head_dim
-        k = k.transpose(1, 2) # b, self.num_heads, s, self.head_dim
-        v = v.transpose(1, 2) # b, self.num_heads, s, self.head_dim
+        q = q.transpose(1, 2) # [b, s, num_heads, head_dim]----->[b, self.num_heads, s, self.head_dim]
+        k = k.transpose(1, 2) # [b, s, num_heads, head_dim]----->[b, self.num_heads, s, self.head_dim]
+        v = v.transpose(1, 2) # [b, s, num_heads, head_dim]----->[b, self.num_heads, s, self.head_dim]
         
         if self.flash_attn:
-        
-            # q*k转置，（b, self.num_heads, s, self.head_dim）* (b, self.num_heads, self.head_dim，s) = （b, self.num_heads, s, s）
-            # q*k/sqrt(self.head_dim)*v  （b, self.num_heads, s, s）* (b, self.num_heads, s, self.head_dim) = b, self.num_heads, s, self.head_dim
+
+            # 使用Flash Attention高效计算注意力
+            # 计算注意力分数，q*k的转置/sqrt(self.head_dim)：[b, self.num_heads, s, self.head_dim]* [b, self.num_heads, self.head_dim，s] = [b, self.num_heads, s, s]
+            # 计算最终结果，q*k的转置/sqrt(self.head_dim)*v：[b, self.num_heads, s, s]* [b, self.num_heads, s, self.head_dim] = [b, self.num_heads, s, self.head_dim]
             output = F.scaled_dot_product_attention(q, k, v, attn_mask=None, 
                                                     dropout_p=self.dropout if self.training else 0.0, 
                                                     is_causal=self.is_causal) 
         else:
+            # 手动计算
             mask = torch.full((1, 1, self.config.max_seq_len, self.config.max_seq_len), float("-inf"))  # 初始化掩码
             mask = torch.triu(mask, diagonal=1)  # 生成上三角掩码
-            scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)  # 计算注意力分数
-            scores = scores + self.mask[:, :, :s, :s]  # 应用掩码
+            # 计算注意力分数，q*k的转置，[b, self.num_heads, s, self.head_dim]* [b, self.num_heads, self.head_dim，s] = [b, self.num_heads, s, s]
+            scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)  
+            scores = scores + self.mask[:, :, :s, :s]  # 应用掩码，让未来的词看不到过去词（因果掩码）
             scores = F.softmax(scores.float(), dim=-1).type_as(q)  # 计算 softmax
             scores = self.attention_dropout(scores)  # 应用注意力 dropout
-            output = torch.matmul(scores, v)  # 计算输出
-        
-        output = output.transpose(1, 2).contiguous().view(b, s, -1) # b, s, self.hidden_size
-        
+            # 计算最终结果，q*k的转置/sqrt(self.head_dim)*v：[b, self.num_heads, s, s]* [b, self.num_heads, s, self.head_dim] = [b, self.num_heads, s, self.head_dim]
+            output = torch.matmul(scores, v)  
+
+        # 变化回原来的形状 [b, self.num_heads, s, self.head_dim] -----> [b, s, self.num_heads, self.head_dim] -----> [b, s, self.self.num_heads * self.head_dim]
+        output = output.transpose(1, 2).contiguous().view(b, s, -1) 
+        # 线性变化回原来的维度 [b, s, self.self.num_heads * self.head_dim] -----> [b, s, hidden_size]
         output = self.o_proj(output)
+        # dropout,防止过拟合
         output = self.residual_dropout(output)
         return output
     
