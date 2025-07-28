@@ -84,14 +84,14 @@ class Attention(nn.Module):
         self.is_causal = True
         self.flash_attn = self.config.flash_attn
 
-        // 线性变化（投影层），分别用于生成Query, Key, Value
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)   //  Q投影矩阵
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)  //  K投影矩阵
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)  //  V投影矩阵
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)  // 用于线性变化回原始维度
+        # 线性变化（投影层），分别用于生成Query, Key, Value
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)   #  Q投影矩阵
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)  #  K投影矩阵
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)  #  V投影矩阵
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)  # 用于线性变化回原始维度
         self.residual_dropout = nn.Dropout(self.dropout)
         self.attention_dropout = nn.Dropout(self.dropout)
-        self.rotary_emb = RotaryEmbedding(self.head_dim)  // 旋转位置编码
+        self.rotary_emb = RotaryEmbedding(self.head_dim)  # 旋转位置编码
         
     def forward(self, hidden_states, use_kv_cache=False):
         # 网络的前向传播过程，这部分是核心逻辑
