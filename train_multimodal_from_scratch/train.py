@@ -35,13 +35,13 @@ class VLM(PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.config = config
-        self.vision_model = AutoModel.from_pretrained(self.config.vision_model_path)
-        self.processor = AutoProcessor.from_pretrained(self.config.vision_model_path)
+        self.vision_model = AutoModel.from_pretrained(self.config.vision_model_path)  # 这里加载了一个视觉编码器模型，即路径里的siglip模型，和一个Qwen2.5的大语言模型
+        self.processor = AutoProcessor.from_pretrained(self.config.vision_model_path)  # processor与tokenizer都是加载数据预处理的模块，但tokenizer一般仅限于自然语言处理中的文本数据，而如果涉及到图片等多模态数据的处理，则需要使用processor
         self.llm_model = AutoModelForCausalLM.from_pretrained(self.config.llm_model_path)
         self.tokenizer = AutoTokenizer.from_pretrained(self.config.llm_model_path)
-        self.linear1 = nn.Linear(self.vision_model.config.vision_config.hidden_size*4, self.llm_model.config.hidden_size)
+        self.linear1 = nn.Linear(self.vision_model.config.vision_config.hidden_size*4, self.llm_model.config.hidden_size)   # 这两个全连接层的作用是将图片编码器的输出投影到LLM的输入，之后图片数据会和文本数据结合送入LLM
         self.linear2 = nn.Linear(self.llm_model.config.hidden_size, self.llm_model.config.hidden_size)
-        if self.config.freeze_vision_model:
+        if self.config.freeze_vision_model:  # 一些冻结模型相关的参数，决定在训练的时候迭代视觉编码器参数还是LLM参数
             for param in self.vision_model.parameters():
                 param.requires_grad = False
         for param in self.llm_model.parameters():
@@ -49,17 +49,17 @@ class VLM(PreTrainedModel):
             param.requires_grad = False
         
     def forward(self, input_ids, labels, pixel_values, attention_mask=None):
-        text_embeds = self.llm_model.get_input_embeddings()(input_ids)
+        text_embeds = self.llm_model.get_input_embeddings()(input_ids)  # 得到文本输入的tokens
         
-        image_embeds = self.vision_model.vision_model(pixel_values).last_hidden_state 
+        image_embeds = self.vision_model.vision_model(pixel_values).last_hidden_state # 得到图片输入的tokens
         b, s, d = image_embeds.shape
         image_embeds = image_embeds.view(b, -1, d*4)  # (b, 196, d) --> (b, 49, d*4) 压缩图片tokens
-        image_features = self.linear2(F.silu(self.linear1(image_embeds)))
+        image_features = self.linear2(F.silu(self.linear1(image_embeds))) # 将图片输入tokens进行线性投影
         
-        text_embeds = text_embeds.to(image_features.dtype)
+        text_embeds = text_embeds.to(image_features.dtype)  # 统一文本和图片tokens的数据格式
         
-        inputs_embeds = self.merge_input_ids_with_image_features(image_features, text_embeds, input_ids)
-        outputs = self.llm_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+        inputs_embeds = self.merge_input_ids_with_image_features(image_features, text_embeds, input_ids) # merge两个数据
+        outputs = self.llm_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask) # 输入llm获得最终输出
         logits = outputs[0]
         loss = None
         if labels is not None:
